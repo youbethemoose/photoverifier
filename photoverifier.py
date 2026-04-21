@@ -46,12 +46,16 @@ def sha256_file(path: Path):
         return None
 
 
-def scan_dir(root: Path, on_file=None) -> Dict[str, Optional[str]]:
+def scan_dir(root: Path, on_file=None, cancel_event=None) -> Dict[str, Optional[str]]:
     """Walk root, skipping hidden files/dirs. Returns {rel_path: hash_or_None}."""
     out: Dict[str, Optional[str]] = {}
     for dp, dirs, files in os.walk(root):
+        if cancel_event and cancel_event.is_set():
+            break
         dirs[:] = [d for d in dirs if not d.startswith(".")]
         for fn in sorted(files):
+            if cancel_event and cancel_event.is_set():
+                return out
             if fn.startswith("."):
                 continue
             full = Path(dp) / fn
@@ -79,8 +83,8 @@ class PhotoVerifier(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PhotoBackup Verifier")
-        self.geometry("860x720")
-        self.minsize(720, 600)
+        self.geometry("860x760")
+        self.minsize(720, 640)
         self.configure(bg=DARK_BG)
         self.resizable(True, True)
 
@@ -89,6 +93,7 @@ class PhotoVerifier(tk.Tk):
         self.src_map: dict = {}
         self.dst_map: dict = {}
         self._busy = False
+        self._cancel = threading.Event()
 
         self._style()
         self._build()
@@ -109,15 +114,20 @@ class PhotoVerifier(tk.Tk):
         s.configure("TButton",     background=SURFACE, foreground=TEXT_FG,
                     font=FONT_UI, padding=6, relief="flat")
         s.map("TButton",
-              background=[("active", "#45475a")],
-              foreground=[("active", TEXT_FG)])
+              background=[("active", "#45475a"), ("disabled", "#2a2a3a")],
+              foreground=[("active", TEXT_FG),   ("disabled", MUTED_FG)])
 
-        s.configure("Scan.TButton",  background="#1e4a8a", foreground="white",
+        s.configure("Scan.TButton",   background="#1e4a8a", foreground="white",
                     font=("SF Pro Text", 11, "bold"), padding=8)
-        s.configure("Sync.TButton",  background="#7c3a00", foreground="white",
+        s.configure("Sync.TButton",   background="#7c3a00", foreground="white",
                     font=("SF Pro Text", 11, "bold"), padding=8)
         s.configure("Verify.TButton", background="#1a5c2a", foreground="white",
                     font=("SF Pro Text", 11, "bold"), padding=8)
+        s.configure("Cancel.TButton", background="#5c1a1a", foreground="white",
+                    font=("SF Pro Text", 11, "bold"), padding=8)
+        s.map("Cancel.TButton",
+              background=[("active", "#7a2020"), ("disabled", "#2a2a3a")],
+              foreground=[("active", "white"),   ("disabled", MUTED_FG)])
 
         s.configure("TProgressbar", troughcolor=SURFACE, background=GREEN,
                     thickness=6)
@@ -158,25 +168,41 @@ class PhotoVerifier(tk.Tk):
         bf = tk.Frame(self, bg=DARK_BG)
         bf.pack(pady=8)
 
-        ttk.Button(bf, text="1  Scan & Compare", style="Scan.TButton",
-                   command=self._scan).pack(side="left", padx=5)
-        ttk.Button(bf, text="2  Sync to Backup", style="Sync.TButton",
-                   command=self._sync).pack(side="left", padx=5)
-        ttk.Button(bf, text="3  Full Verify", style="Verify.TButton",
-                   command=self._verify).pack(side="left", padx=5)
+        self._scan_btn   = ttk.Button(bf, text="1  Scan & Compare", style="Scan.TButton",
+                                      command=self._scan)
+        self._sync_btn   = ttk.Button(bf, text="2  Sync to Backup",  style="Sync.TButton",
+                                      command=self._sync)
+        self._verify_btn = ttk.Button(bf, text="3  Full Verify",      style="Verify.TButton",
+                                      command=self._verify)
+        self._cancel_btn = ttk.Button(bf, text="✕  Cancel",           style="Cancel.TButton",
+                                      command=self._request_cancel, state="disabled")
 
-        # ── progress + status
+        self._scan_btn.pack(side="left", padx=5)
+        self._sync_btn.pack(side="left", padx=5)
+        self._verify_btn.pack(side="left", padx=5)
+        self._cancel_btn.pack(side="left", padx=5)
+
+        # ── progress bar
         pbar_frame = tk.Frame(self, bg=DARK_BG)
-        pbar_frame.pack(fill="x", padx=14, pady=(2, 0))
+        pbar_frame.pack(fill="x", padx=14, pady=(6, 0))
         self.pbar_var = tk.DoubleVar()
         self.pbar = ttk.Progressbar(pbar_frame, variable=self.pbar_var,
                                     maximum=100, style="TProgressbar")
         self.pbar.pack(fill="x")
 
+        # ── progress detail (file counter)
+        detail_frame = tk.Frame(self, bg=DARK_BG)
+        detail_frame.pack(fill="x", padx=14, pady=(2, 0))
+        self.progress_var = tk.StringVar(value="")
+        tk.Label(detail_frame, textvariable=self.progress_var,
+                 bg=DARK_BG, fg=PURPLE, font=("Menlo", 10),
+                 anchor="w").pack(side="left")
+
+        # ── status line
         self.status_var = tk.StringVar(value="Ready — select source and backup drives, then click Scan & Compare.")
         tk.Label(self, textvariable=self.status_var,
                  bg=DARK_BG, fg=MUTED_FG, font=("SF Pro Text", 10),
-                 anchor="w").pack(fill="x", padx=14, pady=(2, 0))
+                 anchor="w").pack(fill="x", padx=14, pady=(1, 0))
 
         # ── summary cards
         cf = tk.Frame(self, bg=DARK_BG)
@@ -249,11 +275,31 @@ class PhotoVerifier(tk.Tk):
         self.status_var.set(msg)
         self.update_idletasks()
 
+    def _set_progress_detail(self, msg: str):
+        self.progress_var.set(msg)
+        self.update_idletasks()
+
     def _update_cards(self, identical, missing, changed, extra):
         self.card_vars["identical"].set(str(len(identical)))
         self.card_vars["missing"].set(str(len(missing)))
         self.card_vars["changed"].set(str(len(changed)))
         self.card_vars["extra"].set(str(len(extra)))
+
+    def _set_busy(self, busy: bool):
+        self._busy = busy
+        state = "disabled" if busy else "normal"
+        cancel_state = "normal" if busy else "disabled"
+        self._scan_btn.configure(state=state)
+        self._sync_btn.configure(state=state)
+        self._verify_btn.configure(state=state)
+        self._cancel_btn.configure(state=cancel_state)
+        if not busy:
+            self._set_progress_detail("")
+
+    def _request_cancel(self):
+        self._cancel.set()
+        self._cancel_btn.configure(state="disabled")
+        self._set_status("Cancelling — finishing current file…")
 
     def _guard(self):
         if self._busy:
@@ -293,7 +339,8 @@ class PhotoVerifier(tk.Tk):
         src, dst = self._paths()
         if not src:
             return
-        self._busy = True
+        self._cancel.clear()
+        self._set_busy(True)
         self._clear_log()
         self._indet(True)
         threading.Thread(target=self._do_scan, args=(src, dst), daemon=True).start()
@@ -302,14 +349,18 @@ class PhotoVerifier(tk.Tk):
         try:
             self.after(0, self._log, f"Scanning SOURCE: {src}", "heading")
             t0 = time.time()
-            count = [0]
 
             def on_src(rel, n):
-                count[0] = n
-                if n % 100 == 0:
-                    self.after(0, self._set_status, f"Scanning source… {n:,} files read")
+                if n % 10 == 0:
+                    self.after(0, self._set_progress_detail,
+                               f"Source  {n:,} files hashed…  {rel[:60]}")
 
-            self.src_map = scan_dir(Path(src), on_src)
+            self.src_map = scan_dir(Path(src), on_src, self._cancel)
+
+            if self._cancel.is_set():
+                self.after(0, self._finish_cancelled)
+                return
+
             elapsed = time.time() - t0
             self.after(0, self._log,
                        f"  {len(self.src_map):,} files in {elapsed:.1f}s", "muted")
@@ -318,18 +369,32 @@ class PhotoVerifier(tk.Tk):
             t1 = time.time()
 
             def on_dst(rel, n):
-                if n % 100 == 0:
-                    self.after(0, self._set_status, f"Scanning backup… {n:,} files read")
+                if n % 10 == 0:
+                    self.after(0, self._set_progress_detail,
+                               f"Backup  {n:,} files hashed…  {rel[:60]}")
 
-            self.dst_map = scan_dir(Path(dst), on_dst)
+            self.dst_map = scan_dir(Path(dst), on_dst, self._cancel)
+
+            if self._cancel.is_set():
+                self.after(0, self._finish_cancelled)
+                return
+
             elapsed = time.time() - t1
             self.after(0, self._log,
                        f"  {len(self.dst_map):,} files in {elapsed:.1f}s", "muted")
 
             self._report_compare()
         finally:
-            self._busy = False
-            self.after(0, self._indet, False)
+            if not self._cancel.is_set():
+                self.after(0, self._set_busy, False)
+                self.after(0, self._indet, False)
+
+    def _finish_cancelled(self):
+        self._indet(False)
+        self._set_busy(False)
+        self._set_status("Cancelled.")
+        self._set_progress_detail("")
+        self._log("— Operation cancelled —", "warn")
 
     def _report_compare(self):
         identical, changed, missing, extra, errors = compare_maps(
@@ -380,6 +445,8 @@ class PhotoVerifier(tk.Tk):
                 else f"{len(missing):,} missing, {len(changed):,} differ — run Sync to Backup."
             )
             self._set_status(status)
+            self._set_busy(False)
+            self._indet(False)
 
         self.after(0, emit)
 
@@ -411,7 +478,8 @@ class PhotoVerifier(tk.Tk):
         if not messagebox.askyesno("Confirm sync", msg):
             return
 
-        self._busy = True
+        self._cancel.clear()
+        self._set_busy(True)
         self._indet(False)
         self.pbar_var.set(0)
         threading.Thread(target=self._do_sync,
@@ -423,22 +491,33 @@ class PhotoVerifier(tk.Tk):
             self._log(f"SYNCING {len(to_copy):,} files to backup…", "heading")
             total = len(to_copy)
             ok = err = 0
+            w = len(str(total))
 
             for i, rel in enumerate(to_copy, 1):
+                if self._cancel.is_set():
+                    self.after(0, self._log,
+                               f"\n— Cancelled after {i-1}/{total} files ({ok} copied, {err} errors) —",
+                               "warn")
+                    self.after(0, self._set_status,
+                               f"Cancelled. {ok} copied, {err} errors.")
+                    return
+
                 src_path = Path(src) / rel
                 dst_path = Path(dst) / rel
                 dst_path.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     shutil.copy2(src_path, dst_path)
-                    self.after(0, self._log, f"  [{i:>{len(str(total))}}/{total}]  {rel}", "ok")
+                    self.after(0, self._log, f"  [{i:{w}}/{total}]  {rel}", "ok")
                     ok += 1
                 except Exception as e:
                     self.after(0, self._log,
-                               f"  [{i:>{len(str(total))}}/{total}]  ERROR {rel}: {e}", "err")
+                               f"  [{i:{w}}/{total}]  ERROR {rel}: {e}", "err")
                     err += 1
 
                 pct = i / total * 100
                 self.after(0, self.pbar_var.set, pct)
+                self.after(0, self._set_progress_detail,
+                           f"{i:,} / {total:,} files  ({pct:.0f}%)  —  {ok} copied, {err} errors")
                 if i % 20 == 0 or i == total:
                     self.after(0, self._set_status,
                                f"Copying… {i:,}/{total:,}  ({ok} ok, {err} errors)")
@@ -457,7 +536,7 @@ class PhotoVerifier(tk.Tk):
                 self.after(0, self._set_status,
                            f"Sync finished: {ok} copied, {err} errors.")
         finally:
-            self._busy = False
+            self.after(0, self._set_busy, False)
 
     # ── step 3: full verify ──────────────────────────────────────────────────
 
@@ -467,7 +546,8 @@ class PhotoVerifier(tk.Tk):
         src, dst = self._paths()
         if not src:
             return
-        self._busy = True
+        self._cancel.clear()
+        self._set_busy(True)
         self._clear_log()
         self._indet(True)
         threading.Thread(target=self._do_verify, args=(src, dst), daemon=True).start()
@@ -480,15 +560,24 @@ class PhotoVerifier(tk.Tk):
                        "Every file's SHA-256 will be recomputed.", "muted")
 
             def on_src(rel, n):
-                if n % 100 == 0:
-                    self.after(0, self._set_status, f"Verifying source… {n:,} files")
+                if n % 10 == 0:
+                    self.after(0, self._set_progress_detail,
+                               f"Source  {n:,} files verified…  {rel[:60]}")
 
             def on_dst(rel, n):
-                if n % 100 == 0:
-                    self.after(0, self._set_status, f"Verifying backup… {n:,} files")
+                if n % 10 == 0:
+                    self.after(0, self._set_progress_detail,
+                               f"Backup  {n:,} files verified…  {rel[:60]}")
 
-            self.src_map = scan_dir(Path(src), on_src)
-            self.dst_map = scan_dir(Path(dst), on_dst)
+            self.src_map = scan_dir(Path(src), on_src, self._cancel)
+            if self._cancel.is_set():
+                self.after(0, self._finish_cancelled)
+                return
+
+            self.dst_map = scan_dir(Path(dst), on_dst, self._cancel)
+            if self._cancel.is_set():
+                self.after(0, self._finish_cancelled)
+                return
 
             self._report_compare()
 
@@ -513,8 +602,8 @@ class PhotoVerifier(tk.Tk):
 
             self.after(0, finish)
         finally:
-            self._busy = False
-            self.after(0, self._indet, False)
+            if not self._cancel.is_set():
+                self.after(0, self._indet, False)
 
 
 # ─── entry ──────────────────────────────────────────────────────────────────
